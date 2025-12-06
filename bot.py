@@ -1244,7 +1244,7 @@ class BreakoutWithATRAndRSI:
 
         # 1) Стоп-лосс при -25% от цены входа: фиксируем убыток и увеличиваем счётчик убыточных сделок.
         if pnl_pct <= -0.25:
-            self._cancel_position(pos, reason=f"stop_loss_-25pct pnl={pnl_pct:.4f}")
+            self._cancel_position(pos, reason=f"stop_loss_-25pct pnl={pnl_pct:.4f}", exit_price=last_price)
             try:
                 self.losses_in_row += 1
             except Exception:
@@ -1256,7 +1256,7 @@ class BreakoutWithATRAndRSI:
 
         # 2) Внутридневной тейк-профит при +7% от цены входа: фиксация прибыли, сброс счётчика убыточных сделок.
         if pnl_pct >= 0.07:
-            self._cancel_position(pos, reason=f"take_profit_intraday_+7pct pnl={pnl_pct:.4f}")
+            self._cancel_position(pos, reason=f"take_profit_intraday_+7pct pnl={pnl_pct:.4f}", exit_price=last_price)
             try:
                 self.losses_in_row = 0
             except Exception:
@@ -1266,7 +1266,7 @@ class BreakoutWithATRAndRSI:
         # 3) В конце дня фиксируем любую положительную доходность.
         # Здесь считаем «концом дня» период после 23:00 локального времени.
         if pnl_pct > 0 and now_local.hour >= 23:
-            self._cancel_position(pos, reason=f"take_profit_eod_positive pnl={pnl_pct:.4f}")
+            self._cancel_position(pos, reason=f"take_profit_eod_positive pnl={pnl_pct:.4f}", exit_price=last_price)
             try:
                 self.losses_in_row = 0
             except Exception:
@@ -1806,8 +1806,33 @@ class BreakoutWithATRAndRSI:
     # события в лог. Фактическое закрытие на бирже происходит за счёт
     # исполнения защитных ордеров. В live-режиме дополнительно пытаемся
     # продать весь доступный остаток базовой валюты рыночным ордером.
-    def _cancel_position(self, pos: Position, reason: str):
-        log_trade(f"EXIT {pos.symbol} side=long reason={reason}")
+    def _cancel_position(self, pos: Position, reason: str, exit_price: Optional[float] = None):
+        def _safe_float(*vals) -> Optional[float]:
+            for v in vals:
+                try:
+                    if v is None:
+                        continue
+                    return float(v)
+                except Exception:
+                    continue
+            return None
+
+        quote_ccy = pos.symbol.split('/')[1] if '/' in pos.symbol else 'QUOTE'
+
+        # Оценка прибыли/убытка в котируемой валюте (обычно EUR)
+        est_exit_px = exit_price
+        if est_exit_px is None:
+            try:
+                est_exit_px = self.ex.last_price(pos.symbol)
+            except Exception:
+                est_exit_px = None
+        if est_exit_px is None or est_exit_px <= 0:
+            est_exit_px = pos.entry
+        est_pnl_quote = (est_exit_px - pos.entry) * pos.qty
+
+        log_trade(
+            f"EXIT {pos.symbol} side=long reason={reason} exit_px={fmt_float(est_exit_px,8)} pnl_quote={est_pnl_quote:.4f} {quote_ccy}"
+        )
 
         if self.cfg.MODE == 'live':
             # 1) Пытаемся отменить все оставшиеся ордера по символу (если что-то висит).
@@ -1821,9 +1846,21 @@ class BreakoutWithATRAndRSI:
                 qty_free = self.ex.base_free(pos.symbol)
                 qty_free = self.ex.round_qty(pos.symbol, qty_free)
                 if qty_free > 0:
-                    self.ex.create_market_sell(pos.symbol, qty_free)
+                    order = self.ex.create_market_sell(pos.symbol, qty_free)
+                    info = order if isinstance(order, dict) else {}
+                    filled_qty = _safe_float(info.get('filled'), info.get('amount'), info.get('info', {}).get('executedQty')) or qty_free
+                    fill_price = _safe_float(
+                        info.get('average'),
+                        info.get('price'),
+                        info.get('cost', 0) / filled_qty if filled_qty else None,
+                        info.get('info', {}).get('avgPrice'),
+                        info.get('info', {}).get('price')
+                    )
+                    if fill_price is None:
+                        fill_price = est_exit_px
+                    actual_pnl_quote = (fill_price - pos.entry) * filled_qty
                     log_trade(
-                        f"FORCE_EXIT {pos.symbol} market_sell_all qty={qty_free:.8f}"
+                        f"FORCE_EXIT {pos.symbol} market_sell_all qty={qty_free:.8f} fill_px={fmt_float(fill_price,8)} pnl_quote={actual_pnl_quote:.4f} {quote_ccy}"
                     )
                 else:
                     log(f"{pos.symbol}: no free base balance to force-sell on exit", True)
